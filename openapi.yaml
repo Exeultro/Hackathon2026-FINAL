@@ -1,0 +1,1250 @@
+openapi: 3.0.3
+info:
+  title: Lecture Search API
+  version: 0.5.0
+  description: |
+    API сервиса семантического поиска по видеолекциям.
+
+    Договорённости:
+    - Все пути под `/api/v1`. Формат - JSON, кодировка UTF-8.
+    - Время создания/обновления - ISO 8601 в UTC.
+    - **Таймкоды - секунды от начала видео, число с дробной частью** (`start: 754.3`).
+      Округлять до секунды для показа - на клиенте.
+    - Авторизация по JWT, подробности в разделе «Авторизация» ниже.
+    - Личные данные (закладки, прогресс просмотра) принадлежат пользователю, если запрос пришёл
+      с токеном. Без токена они привязаны к анонимному клиенту: фронт один раз генерирует UUID
+      и шлёт его в заголовке `X-Client-Id` (так же работает тг-бот). Без токена и без заголовка
+      `/bookmarks` и `/progress` отвечают `400` (`client_id_required`).
+    - При удалении лекции удаляются и её закладки, и прогресс просмотра у всех клиентов.
+    - Видимость лекций и курсов. У каждой лекции и курса есть владелец: пользователь (если
+      создано с токеном или ботом с привязанным Telegram) или анонимный `X-Client-Id`. Видит,
+      правит и удаляет их только владелец; остальным они отвечают `404`, как несуществующие,
+      и не попадают в списки, поиск и чат. Лекции и курсы без владельца (созданные до версии
+      0.5.0) общие: их видят все, но править и удалять их нельзя никому (`403`, `forbidden`).
+      Поле `mine` у лекции и курса - принадлежит ли она тому, кто спрашивает.
+      `playback.url` и `thumbnail_url` - подписанные ссылки (`?exp=…&sig=…`), живут не меньше
+      суток: `<video>` и `<img>` грузят их без заголовков. Субтитры (`subtitles.vtt`) - как
+      остальные пути, с токеном или `X-Client-Id`.
+      Импорт без токена требует `X-Client-Id` (иначе `400 client_id_required`).
+      Лекцию можно положить только в видимый курс (иначе `422`, `course_id`).
+    - CORS: разрешить origin фронта (dev - `http://localhost:5173`) для всех путей, включая
+      `/video` и `/subtitles.vtt` - плеер грузит их с `crossorigin`. Разрешить заголовки
+      `X-Client-Id` и `Authorization` (из-за них браузер шлёт preflight `OPTIONS`).
+    - Модели работают локально (режим «без интернета»): ASR - faster-whisper,
+      эмбеддинги - multilingual-e5, конспект и ответы - локальная LLM через llama.cpp.
+      Что именно запущено - `GET /system`.
+
+    ## Жизненный цикл лекции
+
+    `POST /lectures` (файл) или `POST /lectures/import` (ссылка) сразу возвращают
+    `202` и лекцию в статусе `queued`. Дальше сервер сам проходит этапы:
+
+    `queued -> downloading -> extracting_audio -> transcribing -> indexing -> ready`
+
+    Любой этап может закончиться `failed` (текст в `error`). `downloading` бывает
+    только у импорта по ссылке. Клиент опрашивает `GET /lectures/{id}` раз в 2-3 с,
+    пока статус не `ready`/`failed`; `progress` - доля всего конвейера 0..1.
+
+    При `ready` доступны текст, субтитры, поиск и чат. Конспект делает LLM, это
+    медленнее, поэтому у него свой статус `summary_status`
+    (`pending -> processing -> ready | failed`), который продолжает меняться уже после
+    `ready`. Пока он не `ready`, `GET /lectures/{id}/summary` отдаёт `409`.
+
+    ## Авторизация
+
+    Регистрация и вход по email и паролю. Оба возвращают пару токенов и пользователя:
+
+    - `access_token` - JWT (HS256, `sub` = id пользователя), живёт 15 минут (`expires_in` в
+      секундах). Шлётся в заголовке `Authorization: Bearer <access_token>`.
+    - `refresh_token` - непрозрачная строка, живёт 30 дней и **одноразовая**: `POST /auth/refresh`
+      гасит её и выдаёт новую пару. Повторное использование старой - `401`. В базе хранить
+      только хеш, пароли - тоже только хешем.
+
+    Клиенту: на любой `401` с `code = unauthorized` один раз вызвать `/auth/refresh` и повторить
+    запрос; если refresh тоже `401` - разлогинить. Токены хранятся на фронте (localStorage).
+
+    Если заголовок `Authorization` прислан, но токен битый или истёк, ответ `401` на **любом**
+    пути, включая открытые. Без заголовка открытые пути работают как раньше.
+
+    Что требует токен: загрузка файла (`POST /lectures`), правка и удаление лекции
+    (`PATCH`/`DELETE /lectures/{id}`), создание, правка и удаление курсов. Всё остальное
+    открыто, в том числе импорт по ссылке и retry, которыми пользуется тг-бот.
+
+    Закладки и прогресс, сделанные анонимно (по `X-Client-Id`), к аккаунту при входе не
+    переносятся. Исключение - закладки из тг-бота при привязке Telegram (ниже).
+
+    ## Telegram
+
+    Аккаунт сайта можно привязать к Telegram, тогда закладки в боте и на сайте общие.
+
+    1. Вошедший пользователь на сайте вызывает `POST /auth/telegram/code` и открывает
+       `bot_url` (`https://t.me/<бот>?start=link_<code>`). Код одноразовый, живёт 10 минут.
+    2. Бот получает `/start link_<code>` и вызывает `POST /auth/telegram/link`.
+       Лекции и курсы, импортированные ботом анонимно, тоже переходят в аккаунт.
+
+    Бот ходит в API с общим секретом: заголовки `X-Bot-Secret` (переменная `BOT_SECRET` у API и
+    бота) и `X-Telegram-Id`. Если этот Telegram привязан, запрос выполняется от имени
+    пользователя, как с токеном (закладки, `/auth/me`, всё, что требует входа). Если не
+    привязан - как анонимный клиент по `X-Client-Id`. Неверный секрет - `401`.
+
+    При привязке анонимные закладки бота (его `X-Client-Id` в запросе `link`) переходят в
+    аккаунт. Один Telegram привязан максимум к одному аккаунту: новая привязка снимает старую.
+    Отвязать - `DELETE /auth/telegram` с сайта или из бота.
+
+    ## Поиск
+
+    Семантический (по эмбеддингам) с подмешиванием точных совпадений слов. Индекс
+    строится по фрагментам ~20-40 с, собранным из соседних сегментов транскрипта,
+    поэтому `start`/`end` результата обычно шире одного сегмента. Ссылка на момент -
+    `deep_link`, это путь фронта (`/lectures/{id}?t=<сек>`), а не API.
+  contact:
+    name: Команда
+servers:
+  - url: http://localhost:8000/api/v1
+
+tags:
+  - name: auth
+    description: Регистрация, вход, обновление токенов
+  - name: lectures
+  - name: content
+    description: Транскрипт, субтитры, конспект
+  - name: search
+  - name: chat
+  - name: courses
+  - name: personal
+    description: Закладки и прогресс просмотра, привязаны к пользователю (токен) или к `X-Client-Id`
+  - name: system
+
+paths:
+  /auth/register:
+    post:
+      tags: [auth]
+      summary: Регистрация
+      description: Сразу выполняет вход, отдаёт токены.
+      operationId: register
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/RegisterRequest' }
+      responses:
+        '201':
+          description: Создан
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AuthResponse' }
+        '409':
+          description: Email уже занят (`code = email_taken`)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '422': { $ref: '#/components/responses/ValidationError' }
+
+  /auth/login:
+    post:
+      tags: [auth]
+      summary: Вход
+      operationId: login
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/LoginRequest' }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AuthResponse' }
+        '401':
+          description: Неверный email или пароль (`code = invalid_credentials`), без уточнения, что именно
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '422': { $ref: '#/components/responses/ValidationError' }
+
+  /auth/refresh:
+    post:
+      tags: [auth]
+      summary: Обновить пару токенов
+      description: Присланный `refresh_token` становится недействительным.
+      operationId: refreshTokens
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/RefreshRequest' }
+      responses:
+        '200':
+          description: Новая пара токенов
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AuthResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '422': { $ref: '#/components/responses/ValidationError' }
+
+  /auth/logout:
+    post:
+      tags: [auth]
+      summary: Выход
+      description: Гасит `refresh_token`. Всегда `204`, даже если токен уже недействителен. Access-токен доживает свои 15 минут, фронт его просто забывает.
+      operationId: logout
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/RefreshRequest' }
+      responses:
+        '204': { description: OK }
+
+  /auth/me:
+    get:
+      tags: [auth]
+      summary: Текущий пользователь
+      operationId: getMe
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/User' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /auth/telegram/code:
+    post:
+      tags: [auth]
+      summary: Код для привязки Telegram
+      description: Одноразовый, живёт `expires_in` секунд. Сайт открывает `bot_url`.
+      operationId: createTelegramCode
+      security:
+        - bearerAuth: []
+      responses:
+        '201':
+          description: Создан
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TelegramCode' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /auth/telegram/link:
+    post:
+      tags: [auth]
+      summary: Привязать Telegram (вызывает бот)
+      description: |
+        Только бот (`X-Bot-Secret` + `X-Telegram-Id`). Гасит код, привязывает Telegram к его
+        пользователю и переносит в аккаунт анонимные закладки из `X-Client-Id`.
+      operationId: linkTelegram
+      security:
+        - botAuth: []
+      parameters:
+        - $ref: '#/components/parameters/TelegramId'
+        - $ref: '#/components/parameters/ClientId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [code]
+              properties:
+                code: { type: string }
+                username: { type: string, description: 'Ник в Telegram без @, если есть', example: anya }
+      responses:
+        '200':
+          description: Привязан
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/User' }
+        '400':
+          description: Код неверный, истёк или уже использован (`code = invalid_code`)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '422': { $ref: '#/components/responses/ValidationError' }
+
+  /auth/telegram:
+    delete:
+      tags: [auth]
+      summary: Отвязать Telegram
+      description: С сайта (токен) или из бота (от имени привязанного пользователя).
+      operationId: unlinkTelegram
+      security:
+        - bearerAuth: []
+        - botAuth: []
+      responses:
+        '204': { description: Отвязан }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /lectures:
+    get:
+      tags: [lectures]
+      summary: Список лекций
+      operationId: listLectures
+      parameters:
+        - name: course_id
+          in: query
+          schema: { type: string }
+        - name: status
+          in: query
+          schema: { $ref: '#/components/schemas/LectureStatus' }
+      responses:
+        '200':
+          description: Новые сверху
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/Lecture' }
+    post:
+      tags: [lectures]
+      summary: Загрузить видеофайл
+      description: MP4 или WebM. Лимит размера - 2 ГБ.
+      operationId: uploadLecture
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file]
+              properties:
+                file:
+                  type: string
+                  format: binary
+                title:
+                  type: string
+                  description: По умолчанию - имя файла без расширения
+                course_id: { type: string }
+                language:
+                  $ref: '#/components/schemas/Language'
+      responses:
+        '202':
+          description: Принято, обработка в фоне
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Lecture' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '413': { $ref: '#/components/responses/Error' }
+        '415': { $ref: '#/components/responses/Error' }
+        '422': { $ref: '#/components/responses/ValidationError' }
+
+  /lectures/import:
+    post:
+      tags: [lectures]
+      summary: Импорт по ссылке (YouTube, Vimeo, прямая ссылка на mp4/webm)
+      operationId: importLecture
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [url]
+              properties:
+                url: { type: string, format: uri, example: 'https://www.youtube.com/watch?v=dQw4w9WgXcQ' }
+                title:
+                  type: string
+                  description: По умолчанию - заголовок с площадки
+                course_id: { type: string }
+                language:
+                  $ref: '#/components/schemas/Language'
+      responses:
+        '202':
+          description: Принято, обработка в фоне
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Lecture' }
+        '400':
+          description: Нет ни токена, ни `X-Client-Id` (`code = client_id_required`)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '422': { $ref: '#/components/responses/ValidationError' }
+
+  /lectures/{lecture_id}:
+    parameters:
+      - $ref: '#/components/parameters/LectureId'
+    get:
+      tags: [lectures]
+      summary: Лекция (и статус обработки)
+      operationId: getLecture
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Lecture' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    patch:
+      tags: [lectures]
+      summary: Переименовать / перенести в курс
+      operationId: updateLecture
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                title: { type: string }
+                course_id:
+                  type: string
+                  nullable: true
+                  description: null - убрать из курса
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Lecture' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '422': { $ref: '#/components/responses/ValidationError' }
+    delete:
+      tags: [lectures]
+      summary: Удалить лекцию вместе с видео и индексом
+      operationId: deleteLecture
+      security:
+        - bearerAuth: []
+      responses:
+        '204': { description: Удалено }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /lectures/{lecture_id}/retry:
+    post:
+      tags: [lectures]
+      summary: Перезапустить обработку после failed
+      description: Начинает с этапа, на котором упало. Если упал только конспект - перезапускает конспект.
+      operationId: retryLecture
+      parameters:
+        - $ref: '#/components/parameters/LectureId'
+      responses:
+        '202':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Lecture' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Error' }
+
+  /lectures/{lecture_id}/video:
+    get:
+      tags: [lectures]
+      summary: Видеофайл (для `playback.type = file`)
+      description: Поддерживает `Range`, отдаётся как есть, в `<video src>` / Plyr напрямую.
+      operationId: getLectureVideo
+      parameters:
+        - $ref: '#/components/parameters/LectureId'
+      responses:
+        '200':
+          description: Файл целиком
+          content:
+            video/mp4: { schema: { type: string, format: binary } }
+            video/webm: { schema: { type: string, format: binary } }
+        '206': { description: Часть файла по Range }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /lectures/{lecture_id}/transcript:
+    get:
+      tags: [content]
+      summary: Полный текст с таймкодами
+      description: Для панели текста рядом с плеером (клик - перемотка, подсветка текущего сегмента).
+      operationId: getTranscript
+      parameters:
+        - $ref: '#/components/parameters/LectureId'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Transcript' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/NotReady' }
+
+  /lectures/{lecture_id}/subtitles.vtt:
+    get:
+      tags: [content]
+      summary: Субтитры WebVTT
+      description: Для `<track kind="subtitles">` в плеере. Те же сегменты, что в `/transcript`.
+      operationId: getSubtitles
+      parameters:
+        - $ref: '#/components/parameters/LectureId'
+      responses:
+        '200':
+          description: OK
+          content:
+            text/vtt:
+              schema: { type: string }
+              example: |
+                WEBVTT
+
+                1
+                00:00:00.000 --> 00:00:04.200
+                Добрый день, сегодня говорим о теореме Пифагора.
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/NotReady' }
+
+  /lectures/{lecture_id}/summary:
+    get:
+      tags: [content]
+      summary: Конспект, оглавление и ключевые термины
+      operationId: getSummary
+      parameters:
+        - $ref: '#/components/parameters/LectureId'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Summary' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/NotReady' }
+
+  /search:
+    get:
+      tags: [search]
+      summary: Семантический поиск по фрагментам
+      description: |
+        Без `lecture_id` и `course_id` - по всем лекциям. Ищет только по лекциям в статусе `ready`.
+      operationId: search
+      parameters:
+        - name: q
+          in: query
+          required: true
+          schema: { type: string, minLength: 2, maxLength: 500 }
+          example: объяснение теоремы Пифагора
+        - name: lecture_id
+          in: query
+          schema: { type: string }
+        - name: course_id
+          in: query
+          schema: { type: string }
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 50, default: 10 }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SearchResponse' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422': { $ref: '#/components/responses/ValidationError' }
+
+  /ask:
+    post:
+      tags: [chat]
+      summary: Вопрос-ответ по лекции или курсу
+      description: |
+        RAG: сервер ищет фрагменты как в `/search`, отдаёт их LLM и возвращает ответ со ссылками
+        на источники. Истории на сервере нет - клиент сам присылает прошлые реплики в `history`.
+        Ответ может идти 5-30 с (локальная LLM) - показывать «думает…».
+      operationId: ask
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/AskRequest' }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AskResponse' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422': { $ref: '#/components/responses/ValidationError' }
+
+  /courses:
+    get:
+      tags: [courses]
+      summary: Список курсов
+      operationId: listCourses
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/Course' }
+    post:
+      tags: [courses]
+      summary: Создать курс
+      operationId: createCourse
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CourseInput' }
+      responses:
+        '201':
+          description: Создан
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Course' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '422': { $ref: '#/components/responses/ValidationError' }
+
+  /courses/{course_id}:
+    parameters:
+      - name: course_id
+        in: path
+        required: true
+        schema: { type: string }
+    patch:
+      tags: [courses]
+      summary: Переименовать курс
+      operationId: updateCourse
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CourseInput' }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Course' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '422': { $ref: '#/components/responses/ValidationError' }
+    delete:
+      tags: [courses]
+      summary: Удалить курс
+      description: Лекции не удаляются, у них становится `course_id = null`.
+      operationId: deleteCourse
+      security:
+        - bearerAuth: []
+      responses:
+        '204': { description: Удалено }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /bookmarks:
+    get:
+      tags: [personal]
+      summary: Закладки клиента
+      operationId: listBookmarks
+      security:
+        - bearerAuth: []
+        - {}
+      parameters:
+        - $ref: '#/components/parameters/ClientId'
+        - name: lecture_id
+          in: query
+          schema: { type: string }
+      responses:
+        '200':
+          description: По лекции, затем по `t`
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/Bookmark' }
+        '400': { $ref: '#/components/responses/Error' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+    post:
+      tags: [personal]
+      summary: Поставить закладку на момент
+      operationId: createBookmark
+      security:
+        - bearerAuth: []
+        - {}
+      parameters:
+        - $ref: '#/components/parameters/ClientId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/BookmarkCreate' }
+      responses:
+        '201':
+          description: Создана
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Bookmark' }
+        '400': { $ref: '#/components/responses/Error' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422': { $ref: '#/components/responses/ValidationError' }
+
+  /bookmarks/{bookmark_id}:
+    parameters:
+      - $ref: '#/components/parameters/ClientId'
+      - name: bookmark_id
+        in: path
+        required: true
+        schema: { type: string }
+    patch:
+      tags: [personal]
+      summary: Изменить заметку или момент
+      description: Фронт шлёт PATCH при наборе заметки (с задержкой ~0.8 с), последние данные побеждают.
+      operationId: updateBookmark
+      security:
+        - bearerAuth: []
+        - {}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                note: { type: string, maxLength: 5000 }
+                t: { type: number, minimum: 0 }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Bookmark' }
+        '400': { $ref: '#/components/responses/Error' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422': { $ref: '#/components/responses/ValidationError' }
+    delete:
+      tags: [personal]
+      summary: Удалить закладку
+      operationId: deleteBookmark
+      security:
+        - bearerAuth: []
+        - {}
+      responses:
+        '204': { description: Удалено }
+        '400': { $ref: '#/components/responses/Error' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /progress:
+    get:
+      tags: [personal]
+      summary: Где клиент остановился в каждой лекции
+      description: Для «Продолжить просмотр» на главной и полоски просмотренного на карточках.
+      operationId: listProgress
+      security:
+        - bearerAuth: []
+        - {}
+      parameters:
+        - $ref: '#/components/parameters/ClientId'
+      responses:
+        '200':
+          description: Новые сверху (по `updated_at`)
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/WatchProgress' }
+        '400': { $ref: '#/components/responses/Error' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+    delete:
+      tags: [personal]
+      summary: Очистить историю просмотра клиента
+      operationId: clearProgress
+      security:
+        - bearerAuth: []
+        - {}
+      parameters:
+        - $ref: '#/components/parameters/ClientId'
+      responses:
+        '204': { description: Очищено }
+        '400': { $ref: '#/components/responses/Error' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /lectures/{lecture_id}/progress:
+    put:
+      tags: [personal]
+      summary: Сохранить позицию просмотра
+      description: Фронт шлёт во время просмотра не чаще раза в 5 с. Перезаписывает прошлую позицию.
+      operationId: saveProgress
+      security:
+        - bearerAuth: []
+        - {}
+      parameters:
+        - $ref: '#/components/parameters/LectureId'
+        - $ref: '#/components/parameters/ClientId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [position]
+              properties:
+                position: { type: number, minimum: 0, description: Секунды от начала }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/WatchProgress' }
+        '400': { $ref: '#/components/responses/Error' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /system:
+    get:
+      tags: [system]
+      summary: Какие модели запущены
+      description: Для плашки «работает офлайн» и слайда про технологии.
+      operationId: getSystem
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SystemInfo' }
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+    botAuth:
+      type: apiKey
+      in: header
+      name: X-Bot-Secret
+      description: Общий секрет тг-бота, вместе с заголовком `X-Telegram-Id`
+
+  parameters:
+    ClientId:
+      name: X-Client-Id
+      in: header
+      required: false
+      description: |
+        Анонимный id клиента (UUID), генерируется фронтом один раз. Обязателен, если нет токена.
+        С токеном игнорируется: данные берутся у пользователя. Значения с префиксом `user:`
+        зарезервированы, на них `400`.
+      schema: { type: string, format: uuid }
+    TelegramId:
+      name: X-Telegram-Id
+      in: header
+      required: true
+      description: Id пользователя Telegram, только вместе с `X-Bot-Secret`
+      schema: { type: integer, format: int64 }
+    LectureId:
+      name: lecture_id
+      in: path
+      required: true
+      schema: { type: string }
+
+  responses:
+    Error:
+      description: Ошибка
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    NotFound:
+      description: Не найдено
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    NotReady:
+      description: Ещё обрабатывается (`code = not_ready`)
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    Forbidden:
+      description: Общая лекция или курс, править нельзя (`code = forbidden`)
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    Unauthorized:
+      description: Нет токена, токен битый или истёк (`code = unauthorized`)
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    ValidationError:
+      description: Неверные данные
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+
+  schemas:
+    Error:
+      type: object
+      required: [code, message]
+      properties:
+        code:
+          type: string
+          description: |
+            Машиночитаемый код: `not_found`, `not_ready`, `validation`, `file_too_large`,
+            `unsupported_format`, `bad_url`, `download_failed`, `not_failed` (retry не нужен),
+            `client_id_required`, `unauthorized`, `invalid_credentials`, `email_taken`, `invalid_code`, `forbidden`
+        message: { type: string }
+        details:
+          type: object
+          additionalProperties: true
+          description: Для ошибок валидации - поле -> текст ошибки
+
+    Language:
+      type: string
+      description: Язык речи. `auto` - определит Whisper.
+      enum: [auto, ru, en]
+      default: auto
+
+    LectureStatus:
+      type: string
+      enum: [queued, downloading, extracting_audio, transcribing, indexing, ready, failed]
+
+    SummaryStatus:
+      type: string
+      enum: [pending, processing, ready, failed]
+
+    Playback:
+      type: object
+      description: |
+        Как играть видео. `file` - наш `/lectures/{id}/video`. `youtube`/`vimeo` - встраивание
+        плеера площадки (Plyr умеет оба), `provider_id` - id ролика там.
+      required: [type, url]
+      properties:
+        type:
+          type: string
+          enum: [file, youtube, vimeo]
+        url:
+          type: string
+          description: Для `file` - абсолютный URL видео, для остальных - исходная ссылка
+          example: http://localhost:8000/api/v1/lectures/lec_8f3a/video
+        provider_id:
+          type: string
+          nullable: true
+          example: dQw4w9WgXcQ
+
+    Lecture:
+      type: object
+      required: [id, title, status, progress, summary_status, source, mine, created_at]
+      properties:
+        id: { type: string, example: lec_8f3a }
+        title: { type: string, example: 'Геометрия, лекция 3. Теорема Пифагора' }
+        course_id: { type: string, nullable: true }
+        status: { $ref: '#/components/schemas/LectureStatus' }
+        progress:
+          type: number
+          minimum: 0
+          maximum: 1
+          description: Доля всего конвейера обработки
+          example: 0.42
+        error:
+          type: string
+          nullable: true
+          description: Текст для пользователя при `failed` (или при `summary_status = failed`)
+        summary_status: { $ref: '#/components/schemas/SummaryStatus' }
+        source:
+          type: string
+          enum: [upload, youtube, vimeo, url]
+        source_url:
+          type: string
+          nullable: true
+          description: Исходная ссылка при импорте
+        playback:
+          allOf: [{ $ref: '#/components/schemas/Playback' }]
+          nullable: true
+          description: null, пока видео не скачано/не сохранено
+        duration:
+          type: number
+          nullable: true
+          description: Длительность, с. Известна после `extracting_audio`.
+          example: 3125.6
+        language:
+          type: string
+          nullable: true
+          description: Определённый язык речи (`ru`, `en`, ...)
+        thumbnail_url:
+          type: string
+          nullable: true
+          description: Кадр из видео (jpg), подписанная ссылка
+        mine: { type: boolean, description: 'Лекция принадлежит тому, кто спрашивает (можно править и удалять)' }
+        created_at: { type: string, format: date-time }
+
+    Segment:
+      type: object
+      required: [id, start, end, text]
+      properties:
+        id: { type: integer, description: Порядковый номер в лекции, с 0 }
+        start: { type: number, example: 754.3 }
+        end: { type: number, example: 759.8 }
+        text: { type: string, example: 'Квадрат гипотенузы равен сумме квадратов катетов.' }
+
+    Transcript:
+      type: object
+      required: [lecture_id, language, segments]
+      properties:
+        lecture_id: { type: string }
+        language: { type: string, example: ru }
+        segments:
+          type: array
+          description: По возрастанию `start`, без перекрытий
+          items: { $ref: '#/components/schemas/Segment' }
+
+    OutlineItem:
+      type: object
+      required: [title, start, end, children]
+      properties:
+        title: { type: string, example: Доказательство через площади }
+        start: { type: number, example: 610 }
+        end: { type: number, example: 1180 }
+        summary:
+          type: string
+          nullable: true
+          description: 1-2 предложения о разделе
+        children:
+          type: array
+          description: Подразделы (глубина не больше 2)
+          items: { $ref: '#/components/schemas/OutlineItem' }
+
+    KeyTerm:
+      type: object
+      required: [term, occurrences]
+      properties:
+        term: { type: string, example: гипотенуза }
+        definition:
+          type: string
+          nullable: true
+          description: Как термин объяснён в лекции
+        occurrences:
+          type: array
+          description: Таймкоды упоминаний (начала сегментов), по возрастанию
+          items: { type: number }
+          example: [754.3, 802.1]
+
+    Summary:
+      type: object
+      required: [lecture_id, summary, outline, key_terms]
+      properties:
+        lecture_id: { type: string }
+        summary:
+          type: string
+          description: Краткий конспект всей лекции, Markdown (абзацы, списки, без заголовков H1)
+        outline:
+          type: array
+          description: Оглавление. Разделы верхнего уровня покрывают всю лекцию подряд.
+          items: { $ref: '#/components/schemas/OutlineItem' }
+        key_terms:
+          type: array
+          items: { $ref: '#/components/schemas/KeyTerm' }
+
+    LectureRef:
+      type: object
+      required: [id, title]
+      properties:
+        id: { type: string }
+        title: { type: string }
+        thumbnail_url: { type: string, nullable: true }
+
+    SearchHit:
+      type: object
+      required: [lecture, start, end, text, score, highlights, deep_link]
+      properties:
+        lecture: { $ref: '#/components/schemas/LectureRef' }
+        start: { type: number, example: 748 }
+        end: { type: number, example: 781.5 }
+        text: { type: string, description: Текст фрагмента целиком }
+        score:
+          type: number
+          minimum: 0
+          maximum: 1
+          description: Релевантность, чем больше, тем лучше. Отсортировано по убыванию.
+        highlights:
+          type: array
+          description: |
+            Куски `text`, которые подсветить (точные совпадения слов запроса, с учётом словоформ).
+            Пары `[from, to)` в символах (UTF-16, как `String.slice` в JS). Может быть пусто:
+            фрагмент найден по смыслу.
+          items:
+            type: array
+            minItems: 2
+            maxItems: 2
+            items: { type: integer }
+          example: [[12, 21]]
+        deep_link:
+          type: string
+          example: /lectures/lec_8f3a?t=748
+
+    SearchResponse:
+      type: object
+      required: [query, took_ms, hits]
+      properties:
+        query: { type: string }
+        took_ms: { type: integer, example: 84 }
+        hits:
+          type: array
+          items: { $ref: '#/components/schemas/SearchHit' }
+
+    ChatMessage:
+      type: object
+      required: [role, content]
+      properties:
+        role:
+          type: string
+          enum: [user, assistant]
+        content: { type: string }
+
+    AskRequest:
+      type: object
+      required: [question]
+      properties:
+        question: { type: string, minLength: 2, maxLength: 1000 }
+        lecture_id:
+          type: string
+          description: Спрашивать по одной лекции. Без него и без `course_id` - по всем.
+        course_id: { type: string }
+        history:
+          type: array
+          maxItems: 20
+          items: { $ref: '#/components/schemas/ChatMessage' }
+
+    AskResponse:
+      type: object
+      required: [answer, sources]
+      properties:
+        answer:
+          type: string
+          description: Markdown. Ссылки на источники в тексте - `[1]`, `[2]` - номера по `sources`.
+        sources:
+          type: array
+          description: Фрагменты, на которые опирался ответ, `[1]` = `sources[0]`
+          items: { $ref: '#/components/schemas/SearchHit' }
+
+    Course:
+      type: object
+      required: [id, title, lecture_count, mine, created_at]
+      properties:
+        id: { type: string, example: crs_geom }
+        title: { type: string, example: Геометрия, 8 класс }
+        lecture_count: { type: integer, description: 'Сколько лекций курса видит тот, кто спрашивает' }
+        mine: { type: boolean, description: 'Курс принадлежит тому, кто спрашивает' }
+        created_at: { type: string, format: date-time }
+
+    CourseInput:
+      type: object
+      required: [title]
+      properties:
+        title: { type: string, minLength: 1, maxLength: 200 }
+
+    Bookmark:
+      type: object
+      required: [id, lecture_id, lecture_title, t, note, created_at, updated_at]
+      properties:
+        id: { type: string, example: bm_3k9x }
+        lecture_id: { type: string }
+        lecture_title:
+          type: string
+          description: Текущее название лекции (для страницы закладок без лишних запросов)
+        t: { type: number, description: Момент, секунды, example: 62 }
+        note: { type: string, description: Заметка, может быть пустой, example: Важно для контрольной }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+
+    BookmarkCreate:
+      type: object
+      required: [lecture_id, t]
+      properties:
+        lecture_id: { type: string }
+        t: { type: number, minimum: 0 }
+        note: { type: string, maxLength: 5000, default: '' }
+
+    WatchProgress:
+      type: object
+      required: [lecture_id, position, updated_at]
+      properties:
+        lecture_id: { type: string }
+        position: { type: number, description: Секунды от начала, example: 60 }
+        updated_at: { type: string, format: date-time }
+
+    SystemInfo:
+      type: object
+      required: [offline, models]
+      properties:
+        offline:
+          type: boolean
+          description: Все модели локальные, внешние API не используются
+        models:
+          type: object
+          required: [asr, embeddings, llm]
+          properties:
+            asr: { type: string, example: faster-whisper large-v3-turbo }
+            embeddings: { type: string, example: intfloat/multilingual-e5-base }
+            llm: { type: string, example: gemma-4-26b-a4b q4_K }
+
+    RegisterRequest:
+      type: object
+      required: [email, password, name]
+      properties:
+        email:
+          type: string
+          format: email
+          maxLength: 254
+          description: Без учёта регистра, сервер приводит к нижнему и обрезает пробелы
+          example: student@example.com
+        password: { type: string, minLength: 8, maxLength: 64 }
+        name:
+          type: string
+          minLength: 1
+          maxLength: 64
+          description: Как показывать в интерфейсе, пробелы по краям обрезаются
+          example: Аня
+
+    LoginRequest:
+      type: object
+      required: [email, password]
+      properties:
+        email: { type: string, example: student@example.com }
+        password: { type: string }
+
+    RefreshRequest:
+      type: object
+      required: [refresh_token]
+      properties:
+        refresh_token: { type: string }
+
+    User:
+      type: object
+      required: [id, email, name, created_at, telegram]
+      properties:
+        id: { type: string, example: usr_3c9e01ab42f7 }
+        email: { type: string, example: student@example.com }
+        name: { type: string, example: Аня }
+        created_at: { type: string, format: date-time }
+        telegram:
+          type: object
+          nullable: true
+          description: Привязанный Telegram, `null` - не привязан
+          required: [id, username]
+          properties:
+            id: { type: integer, format: int64, example: 123456789 }
+            username: { type: string, nullable: true, example: anya }
+
+    TelegramCode:
+      type: object
+      required: [code, bot_url, expires_in]
+      properties:
+        code: { type: string }
+        bot_url: { type: string, example: 'https://t.me/poisklkbot?start=link_3f9a0c' }
+        expires_in: { type: integer, example: 600 }
+
+    AuthResponse:
+      type: object
+      required: [access_token, refresh_token, token_type, expires_in, user]
+      properties:
+        access_token: { type: string, description: 'JWT для заголовка `Authorization: Bearer <access_token>`' }
+        refresh_token: { type: string }
+        token_type: { type: string, enum: [Bearer] }
+        expires_in: { type: integer, description: Сколько секунд живёт access_token, example: 900 }
+        user: { $ref: '#/components/schemas/User' }

@@ -1,0 +1,14 @@
+data/
+*.mp4
+*.webm
+*.wav
+*.gguf
+*.tar.gz
+
+.venv/
+__pycache__/
+*.pyc
+tmp/
+
+.env
+

@@ -1,0 +1,28 @@
+include:
+  - backend/docker-compose.yml
+
+services:
+  frontend:
+    build:
+      context: ./frontend
+      args:
+        VITE_API_URL: ${PUBLIC_URL:-http://localhost:8000}/api/v1
+    container_name: lecture-frontend
+    ports:
+      - "8080:80"
+    depends_on:
+      - backend
+
+  bot:
+    build: ./bot
+    container_name: lecture-bot
+    env_file:
+      - path: ./bot/.env
+        required: false
+    environment:
+      API_URL: http://backend:8000/api/v1
+      BOT_SECRET: ${BOT_SECRET:-dev-bot-secret-change-me}
+      FRONT_URL: ${FRONT_URL:-http://localhost:8080}
+    depends_on:
+      - backend
+    restart: on-failure:5

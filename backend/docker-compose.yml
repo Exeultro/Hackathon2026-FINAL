@@ -1,0 +1,69 @@
+services:
+  db:
+    image: pgvector/pgvector:pg16
+    container_name: lecture-db
+    environment:
+      POSTGRES_USER: lecture
+      POSTGRES_PASSWORD: lecture
+      POSTGRES_DB: lecture
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U lecture -d lecture"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  migrate:
+    image: migrate/migrate:v4.17.0
+    volumes:
+      - ./migrations:/migrations:ro
+    command: >
+      -path=/migrations
+      -database postgres://lecture:lecture@db:5432/lecture?sslmode=disable
+      up
+    depends_on:
+      db:
+        condition: service_healthy
+
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: lecture-backend
+    ports:
+      - "8000:8000"
+    environment:
+      PORT: "8000"
+      DATA_DIR: /data
+      DATABASE_URL: postgres://lecture:lecture@db:5432/lecture?sslmode=disable
+      ML_URL: http://ml-service:8001
+      PUBLIC_URL: ${PUBLIC_URL:-http://localhost:8000}
+      JWT_SECRET: ${JWT_SECRET:-dev-secret-change-me}
+      BOT_SECRET: ${BOT_SECRET:-dev-bot-secret-change-me}
+      BOT_USERNAME: ${BOT_USERNAME:-poisklkbot}
+    volumes:
+      - media:/data
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+
+
+  ml-service:
+    build: ./ml-service
+    container_name: lecture-ml
+    ports:
+      - "8001:8001"
+    volumes:
+      - ./ml-service/models:/app/models
+      - hf-cache:/root/.cache/huggingface
+    environment:
+      HF_HOME: /root/.cache/huggingface
+    restart: unless-stopped
+
+volumes:
+  media:
+  pgdata:
+  hf-cache:
