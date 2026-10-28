@@ -31,6 +31,7 @@ func GetLectureVideo(s store.Store, files *storage.Files) http.HandlerFunc {
 		}
 		defer f.Close()
 
+		// Content-Type по расширению; ServeContent сам разберётся с Range.
 		ext := strings.ToLower(filepath.Ext(*lec.VideoPath))
 		switch ext {
 		case ".mp4":
@@ -45,6 +46,7 @@ func GetLectureVideo(s store.Store, files *storage.Files) http.HandlerFunc {
 			return
 		}
 
+		// ServeContent умеет Range, 206, Accept-Ranges, If-Modified-Since и т.д.
 		http.ServeContent(w, r, filepath.Base(*lec.VideoPath), stat.ModTime(), f)
 	}
 }

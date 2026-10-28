@@ -168,6 +168,8 @@ func toAPIUser(u store.User) map[string]any {
 	}
 }
 
+// identify resolves the caller: a bearer token, or the Telegram bot (shared secret plus
+// X-Telegram-Id) acting for a linked user. A broken credential is a 401 on any path.
 func (a *authAPI) identify(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		ctx := r.Context()

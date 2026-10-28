@@ -15,6 +15,7 @@ type SearchHit struct {
 	ThumbnailPath *string
 }
 
+// Ordering by the score expression keeps the scan exact: an HNSW scan with a WHERE filter can return fewer rows than LIMIT.
 func (s *pgStore) SearchChunks(ctx context.Context, vec []float32, limit int, lectureID, courseID *string, viewer string) ([]SearchHit, error) {
 	q := `
 		SELECT c.lecture_id, l.title, c.start_sec, c.end_sec, c.text,

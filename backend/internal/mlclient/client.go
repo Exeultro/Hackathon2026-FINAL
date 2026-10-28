@@ -21,6 +21,7 @@ type Client struct {
 func New(base string) *Client {
 	return &Client{
 		base: base,
+		// ASR of a long lecture and the map-reduce summary on CPU can take well over an hour.
 		http: &http.Client{Timeout: 4 * time.Hour},
 	}
 }

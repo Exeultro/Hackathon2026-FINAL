@@ -1,0 +1,4 @@
+  ml-service:
+    build:
+      context: ./backend/ml-service
+      dockerfile: Dockerfile

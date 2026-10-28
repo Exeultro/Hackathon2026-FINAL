@@ -28,6 +28,7 @@ func CORS() func(http.Handler) http.Handler {
 	}
 }
 
+// viewer is whose private lectures and courses the caller sees: the signed-in user, else X-Client-Id ("" = shared only)
 func viewer(r *http.Request) string {
 	if id := userID(r); id != "" {
 		return store.UserOwner(id)
@@ -38,6 +39,7 @@ func viewer(r *http.Request) string {
 	return ""
 }
 
+// lectureFor loads a lecture the caller may see; someone else's private lecture is a 404 like a missing one
 func lectureFor(w http.ResponseWriter, r *http.Request, s store.Store, id string) (*store.Lecture, bool) {
 	l, err := s.GetLecture(r.Context(), id)
 	if err != nil && !errors.Is(err, store.ErrNotFound) {
@@ -56,6 +58,7 @@ func mine(owner *string, r *http.Request) bool {
 	return owner != nil && v != "" && *owner == v
 }
 
+// ownLecture is lectureFor for changes: shared lectures are read-only (403)
 func ownLecture(w http.ResponseWriter, r *http.Request, s store.Store, id string) (*store.Lecture, bool) {
 	l, ok := lectureFor(w, r, s, id)
 	if ok && !mine(l.Owner, r) {
@@ -65,6 +68,7 @@ func ownLecture(w http.ResponseWriter, r *http.Request, s store.Store, id string
 	return l, ok
 }
 
+// ownCourse writes 404 for a course the caller can't see and 403 for a shared one
 func ownCourse(w http.ResponseWriter, r *http.Request, s store.Store, id string) bool {
 	c, err := s.GetCourse(r.Context(), id)
 	if err != nil || !store.Visible(c.Owner, viewer(r)) {
@@ -83,6 +87,7 @@ func courseVisible(r *http.Request, s store.Store, id string) bool {
 	return err == nil && store.Visible(c.Owner, viewer(r))
 }
 
+// owner is the key of the caller's bookmarks and progress: the signed-in user, else X-Client-Id
 func owner(w http.ResponseWriter, r *http.Request) string {
 	if id := userID(r); id != "" {
 		return store.UserOwner(id)

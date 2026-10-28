@@ -16,6 +16,7 @@ func RegisterRoutes(r chi.Router, s store.Store, files *storage.Files, pipe *pip
 	r.Get("/health", HealthHandler)
 
 	r.Route("/api/v1", func(r chi.Router) {
+		// Token issuing must work with an expired access token still attached
 		r.Post("/auth/register", a.register)
 		r.Post("/auth/login", a.login)
 		r.Post("/auth/refresh", a.refresh)

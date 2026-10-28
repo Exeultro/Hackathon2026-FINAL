@@ -92,6 +92,7 @@ func itoaF(f float64) string {
 	return strconv.FormatInt(int64(f), 10)
 }
 
+// highlights marks words of text that share a stem with a query word, as UTF-16 [from, to) pairs.
 func highlights(text, query string) [][]int {
 	var stems []string
 	for _, w := range strings.FieldsFunc(strings.ToLower(query), notWordRune) {

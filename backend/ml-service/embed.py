@@ -9,6 +9,7 @@ def _get_model():
     return _model
 
 def embed(texts: list[str]) -> list[list[float]]:
+    """Без префиксов — Go уже добавил passage:/query:."""
     model = _get_model()
     vecs = model.encode(texts, normalize_embeddings=True, batch_size=16)
     return vecs.tolist()

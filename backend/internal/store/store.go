@@ -127,6 +127,7 @@ func NewID(prefix string) string {
 	return prefix + hex.EncodeToString(b)
 }
 
+// Visible: shared rows (no owner) are seen by everyone, owned ones only by their owner
 func Visible(owner *string, viewer string) bool {
 	return owner == nil || (viewer != "" && *owner == viewer)
 }

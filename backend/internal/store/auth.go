@@ -68,6 +68,8 @@ func (s *pgStore) SaveTelegramCode(ctx context.Context, code, userID string, exp
 	return err
 }
 
+// LinkTelegram consumes a one-time code, moves the Telegram account to its user
+// (unlinking it from anyone else) and hands the bot's anonymous bookmarks, lectures and courses over to the user.
 func (s *pgStore) LinkTelegram(ctx context.Context, code string, telegramID int64, username, anonOwner string) (*User, error) {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
@@ -125,6 +127,8 @@ func (s *pgStore) UnlinkTelegram(ctx context.Context, userID string) error {
 
 const userOwnerPrefix = "user:"
 
+// UserOwner is the owner key of a signed-in user's bookmarks and progress;
+// anonymous rows are keyed by the raw X-Client-Id.
 func UserOwner(userID string) string { return userOwnerPrefix + userID }
 
 func ownerUserID(owner string) *string {

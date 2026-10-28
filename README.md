@@ -42,7 +42,7 @@ docker compose up --build
 
 Если интерфейс открывают не с этой же машины, задайте адрес API, который видит браузер: `PUBLIC_URL=http://<ip>:8000 docker compose up --build`.
 
-Токены входа подписываются ключом `JWT_SECRET`, по умолчанию `dev-secret-change-me`.
+Токены входа подписываются ключом `JWT_SECRET`, по умолчанию `dev-secret-change-me`. Не для демо на своей машине - задать свой: `JWT_SECRET=<длинная случайная строка> docker compose up --build`.
 
 ## Telegram-бот
 
@@ -85,5 +85,5 @@ VITE_API_URL=http://localhost:8000/api/v1 npm run dev
 ## Для разработчиков
 
 - `openapi.yaml` - единый источник правды по API. После изменения контракта: `npm run gen:api` во `frontend/`.
-- `frontend/src/api/` - клиент: `httpApi.ts` (настоящий бэкенд).
+- `frontend/src/api/` - клиент: `httpApi.ts` (настоящий бэкенд), `mockApi.ts` и `mockData.ts` (мок).
 - `frontend/scripts/demo-video.sh` - генерирует видео для демо-лекций мока в `frontend/public/demo/` (нужен ffmpeg).

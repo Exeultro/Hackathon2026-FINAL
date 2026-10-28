@@ -27,6 +27,7 @@ RUN pip install --no-cache-dir \
     --retries 10 \
     -r requirements.txt
 
+# Built on the machine that runs it: native flags give AVX2/FMA, ~10x faster than the AVX-only build.
 ENV CMAKE_ARGS="-DGGML_NATIVE=ON"
 RUN pip install --no-cache-dir \
     --default-timeout=1000 \
