@@ -50,6 +50,8 @@ Linux/MacOS
 curl -L -o ml-service/llama_cpp_python-0.3.1.tar.gz "https://files.pythonhosted.org/packages/b5/14/85052d76d7f92ed97de7a7bc54f6b6cc04c2c25f6d8775cfe37d976e1842/llama_cpp_python-0.3.1.tar.gz"
 ```
 
+Запуск из корня проекта:
+
 ```bash
 docker compose up --build
 ```
@@ -65,7 +67,7 @@ docker compose up --build
 
 ## Telegram-бот
 
-Бот [@poisklkbot](https://t.me/poisklkbot) - второй клиент того же API: поиск, вопросы по лекциям, конспект, оглавление, термины, импорт по ссылке и закладки.
+Бот - второй клиент того же API: поиск, вопросы по лекциям, конспект, оглавление, термины, импорт по ссылке и закладки.
 
 Аккаунт сайта можно привязать к Telegram: Настройки → «Привязать Telegram» открывает бота, он подтверждает привязку, и закладки в боте и на сайте становятся общими (прежние закладки из бота переходят в аккаунт). Статус и отвязка в боте - `/account`. Бот ходит в API с общим секретом `BOT_SECRET` (по умолчанию `dev-bot-secret-change-me`, compose передаёт его и API, и боту; для запуска без Docker - в `bot/.env`).
 
