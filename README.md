@@ -31,6 +31,25 @@
 
 Нужен Docker с Compose v2.20+ и около 15 ГБ места.
 
+### Скачать архив llama-cpp-python
+### 1. Создай папку для моделей
+
+```bash
+mkdir -p ml-service/models
+cd ml-service/models
+```
+
+Он нужен для сборки `llama-cpp-python` из исходников (без AVX-512, чтобы работало на любом CPU).
+
+```powershell
+curl.exe -L -o ml-service/llama_cpp_python-0.3.1.tar.gz "https://files.pythonhosted.org/packages/b5/14/85052d76d7f92ed97de7a7bc54f6b6cc04c2c25f6d8775cfe37d976e1842/llama_cpp_python-0.3.1.tar.gz"
+```
+
+Linux/MacOS
+```bash
+curl -L -o ml-service/llama_cpp_python-0.3.1.tar.gz "https://files.pythonhosted.org/packages/b5/14/85052d76d7f92ed97de7a7bc54f6b6cc04c2c25f6d8775cfe37d976e1842/llama_cpp_python-0.3.1.tar.gz"
+```
+
 ```bash
 docker compose up --build
 ```
